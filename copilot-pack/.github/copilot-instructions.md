@@ -25,6 +25,7 @@ Never violate these (enforced by architecture tests). Interfaces (ports) live in
 - Recon runs are immutable and versioned (`RunId`, `IsLatest`). Never UPDATE recon results — new version.
 - Justifications attach to `SeriesKey`, never `RunId` or `InstanceKey`.
 - Parameterized SQL only. No string-concatenated SQL anywhere.
+- SQL Server credentials come from HashiCorp Vault at runtime via `ISqlConnectionFactory` — never embed credentials in connection strings, appsettings, or user secrets. All DB access (EF, Dapper, SqlBulkCopy, Hangfire) obtains connections through the factory. Never log credentials or Vault tokens.
 - Async end-to-end: no `.Result`/`.Wait()`; `CancellationToken` on every async signature.
 - Optimistic concurrency (`rowversion`) on user-editable entities.
 
