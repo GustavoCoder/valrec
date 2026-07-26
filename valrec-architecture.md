@@ -104,9 +104,34 @@ Valrec.sln
 staging.{System}_{FileType}          -- raw per-layout columns, FileId FK, truncate-reload
                                      --   (e.g., MOR_Positions, MOR_Measures, MOR_FXRates,
                                      --    GR_BrazilRec, GR_BrazilAttribution, RISCO_MOR...)
-core.CanonicalPosition               -- normalized: BusinessDate, System, Side(G/L), Desk,
-                                     --   Product, Underlying, PositionKey, Qty, measures...
-                                     --   (clustered columnstore index)
+core.GlobalPosition                  -- lean global side: BusinessDate, System, Division,
+                                     --   PositionKey, MatchingKey, ResolvedMatchKey, BookId,
+                                     --   BookName, InstrumentId, ISIN, MaturityDate, Amount,
+                                     --   Product, ProductType, Notional, UnderlyingPrice,
+                                     --   InstrumentType, FileId (clustered columnstore)
+core.LocalPosition                   -- rich local side: adds SubBook, LocalBookId,
+                                     --   SourceSystem, SecurityCode, PricingClass, AssetName,
+                                     --   PositionType, Currency, TransactionId, FixingDate,
+                                     --   ErrorMessage, SourceErrorMessage, ... + same
+                                     --   matching spine (MatchingKey, ResolvedMatchKey,
+                                     --   BookId, ISIN, MaturityDate, Amount, Notional)
+                                     --   (clustered columnstore). Separate table — the two
+                                     --   sides carry genuinely different attributes.
+core.PositionMatchable (view)        -- projects the common matching spine + ResolvedMatchKey
+                                     --   from both position tables; the engine's position
+                                     --   join targets this view.
+core.CanonicalMeasure                -- unified, side-discriminated, tall/narrow:
+                                     --   BusinessDate, System, Division, Side(G/L), PositionKey,
+                                     --   SourceMeasure, CanonicalMeasure, Dimension, Underlying,
+                                     --   Value, Currency, Unit, FxRateApplied, FileId
+                                     --   (clustered columnstore). PositionKey links measures
+                                     --   to their position WITHIN a side (not across sides).
+ref.MeasureNameMap                   -- System, SourceMeasure → CanonicalMeasure
+                                     --   (config-as-data, audited; unmapped = hard failure)
+ref.ProductClassMap                  -- System, Side, SourceProductValue → canonical Product
+                                     --   (incl. MM-OPEN/MM-SIG via global MatchingKey marker)
+match.MatchRule                      -- System, Product, Side(G/L), ColumnOrder[] projected
+                                     --   into ResolvedMatchKey; audited (see matching-rules.md)
 recon.Run                            -- RunId, BusinessDate, System, Version, Status,
                                      --   TriggeredBy, StartedAt, CompletedAt, IsLatest
 recon.Result                         -- RunId, matching dims, GlobalValue, LocalValue,
@@ -182,18 +207,25 @@ Runs are immutable. A re-run creates `Version = max+1` and flips `IsLatest`. All
 3. **Stream → SqlBulkCopy** into per-file-type staging (batched, e.g., 50k rows), constant memory.
 4. **Validation pass** (set-based in SQL): row counts vs file header, mandatory fields, duplicate keys → reject file to dead-letter with a diagnostic report rather than partially loading.
 5. **ManifestCompletionTracker** (DB-backed, restart-safe): `ops.FileManifest` defines, per recon unit, the mandatory file types (global set + RISCO counterpart) and optionals. Recon is enqueued only when **all mandatory files have landed and validated**. Optional files never block; a late-arriving optional triggers behavior per manifest config (`OnLateOptional: Ignore | TriggerRerun`, default TriggerRerun — cheap and safe under run versioning).
-6. **Assembly step** (per system, runs at manifest completion): joins the file set into canonical records — e.g., MOR measures keyed to positions with FX conversion applied from MOR's own FXRates file (self-consistent with the global calculation); GR BrazilRec + BrazilAttribution combined, MRC errors applied per its functional role (exclusions/annotations — to confirm). Cross-file semantics live here, not in adapters.
+6. **Assembly / canonicalization step** (per system, per side, runs at manifest completion — this is pipeline phase 2). Each side canonicalizes independently (global doesn't wait for local). Produces `core.GlobalPosition` / `core.LocalPosition` + `core.CanonicalMeasure`, and within it:
+   - classifies Product via `ref.ProductClassMap` (incl. MM-OPEN/MM-SIG from the global MatchingKey `OP` marker);
+   - resolves `ResolvedMatchKey` via `match.MatchRule` (shared `MatchKeyResolver`, never in the engine);
+   - normalizes measure names via `ref.MeasureNameMap` (both SourceMeasure and CanonicalMeasure stored) and applies FX/unit normalization — MOR FX from MOR's own FXRates file, rate stamped on measure rows;
+   - GR combines BrazilRec + BrazilAttribution, applies MRC errors per its functional role [semantics TBC];
+   - integrity check before commit: every CanonicalMeasure matches a position on the natural key (no orphans); unmapped product or measure name → hard failure.
+   Canonical output is versioned per (BusinessDate, System, FileVersion) so re-runs record which canonical versions they compared.
 7. **Idempotency**: file hash recorded; re-delivered identical files are no-ops; changed re-deliveries trigger a versioned re-run of the affected recon unit.
+
+**Pipeline phases** (distinct triggers, distinct grains): **(1) Ingest** — file → typed staging, per file, on arrival. **(2) Canonicalize + resolve** — staging → canonical positions/measures with product classification, match-key resolution, measure/FX/unit normalization, per system per side, at manifest completion. **(3) Link + compare** — the recon engine (§6), per recon-unit pair, when both sides are canonical. The split lets phase 3 (volatile: thresholds, matching tolerance) re-run cheaply against stable phase-2 canonical data without re-parsing files, and makes the canonical layer inspectable for break investigation and the Excel parallel-run gate.
 
 ---
 
 ## 6. Recon Engine
 
-- Aggregation and matching as **set-based SQL** over canonical tables (columnstore), orchestrated by a C# job:
-  1. Aggregate both sides to the matching grain (desk/product/underlying/position key).
-  2. FULL OUTER JOIN global vs local → classify: matched, global-only, local-only (position breaks).
-  3. For matched rows, compare each measure; resolve threshold via precedence; compute Diff/DiffPct; classify OK vs MeasureBreak.
-  4. Persist results + breaks under new RunId; flip IsLatest; re-attach justifications by BreakKey; publish SignalR progress + completion event.
+- Runs on already-canonicalized data (phase 3 of the pipeline). ResolvedMatchKey was computed in phase 2, so the engine's join is uniform regardless of product-specific matching logic. Set-based SQL over columnstore, orchestrated by a C# job:
+  1. Position matching: FULL OUTER JOIN global vs local via `core.PositionMatchable` on `(BusinessDate, System, Division, ResolvedMatchKey)` → matched pairs, global-only, local-only (position breaks). [Grain 1:1 pending SecurityCode-product cardinality check — see matching-rules.md; non-unique keys require pre-aggregation.]
+  2. Measure comparison: for each matched pair, pull global measures via the global position's PositionKey and local measures via the local position's PositionKey (measures link to positions WITHIN a side), then align the two measure sets on `CanonicalMeasure` + `Dimension`. The two sides' measures meet only through the matched position pair — never joined global-to-local on PositionKey directly. Resolve threshold via precedence; compute Diff/DiffPct (unit/currency-aware); classify OK vs MeasureBreak. A CanonicalMeasure present on one side only for a matched pair is a one-sided measure break.
+  3. Persist results + breaks under new RunId; flip IsLatest; re-attach justifications by SeriesKey; publish SignalR progress + completion event.
 - Target: full run for one system/date in low minutes even at tens of millions of staged rows; measure and budget this in Phase 7 load tests.
 
 ---
